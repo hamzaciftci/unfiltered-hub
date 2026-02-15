@@ -1,0 +1,26 @@
+name = "unfilteredhub-doh"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# ── KV Namespace: Blocklist ──
+# Önce KV namespace oluştur:
+#   npx wrangler kv namespace create BLOCKLIST
+# Dönen ID'yi aşağıya yapıştır:
+# [[kv_namespaces]]
+# binding = "BLOCKLIST"
+# id = "BURAYA_KV_NAMESPACE_ID"
+
+# ── Admin API Key ──
+# Production: npx wrangler secret put ADMIN_KEY
+# Local dev: aşağıdaki [vars] bölümünü kullanabilirsiniz.
+
+[vars]
+ADMIN_KEY = "test-secret-123"
+# ADMIN_ALLOWED_IPS = "1.2.3.4,5.6.7.8"  # İsteğe bağlı: Admin erişimine izin verilen IP'ler
+# UPSTREAM = "google,cloudflare,quad9"    # Varsayılan: Cloudflare → Google → Quad9
+
+# ── İsteğe bağlı: Özel alan adı ──
+# Cloudflare Dashboard → Workers & Pages → unfilteredhub-doh → Settings → Triggers
+# routes = [
+#   { pattern = "doh.seninalanadin.com", custom_domain = true }
+# ]

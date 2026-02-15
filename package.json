@@ -1,0 +1,14 @@
+{
+  "name": "unfilteredhub-doh",
+  "version": "1.0.0",
+  "private": true,
+  "description": "UnfilteredHub — Kendi DNS-over-HTTPS sunucun",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0",
+    "typescript": "^5.7.0"
+  }
+}
