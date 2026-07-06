@@ -136,6 +136,35 @@ export async function verifyHmac(
   return { valid: true };
 }
 
+/* ── Weak key rejection ─────────────────────────────────── */
+
+const MIN_KEY_LENGTH = 16;
+
+/** Known default/placeholder values that must never protect production. */
+const WEAK_KEYS = new Set([
+  'test-secret-123',
+  'changeme',
+  'change-me',
+  'admin',
+  'password',
+  'secret',
+  'letmein',
+  '123456',
+  '12345678',
+  'admin123',
+  'your-secret-key',
+  'your-admin-key',
+]);
+
+/**
+ * Reject default/short admin keys. Fail closed: a weak key means the
+ * admin API stays disabled until a real secret is configured via
+ * `wrangler secret put ADMIN_KEY`.
+ */
+export function isWeakAdminKey(key: string): boolean {
+  return key.length < MIN_KEY_LENGTH || WEAK_KEYS.has(key.toLowerCase());
+}
+
 /* ── Auth result type ───────────────────────────────────── */
 
 export interface AdminAuthResult {
@@ -168,6 +197,21 @@ export async function authenticateAdmin(
       authAttemptFailed: false,
       response: Response.json(
         { error: 'Admin API not configured. Set ADMIN_KEY secret.' },
+        { status: 503 },
+      ),
+    };
+  }
+
+  // ── 0b. Weak/default ADMIN_KEY — fail closed ────────
+  if (isWeakAdminKey(adminKey)) {
+    return {
+      authenticated: false,
+      authAttemptFailed: false,
+      response: Response.json(
+        {
+          error: 'ADMIN_KEY is too weak (default or under 16 chars). '
+            + 'Set a strong secret: npx wrangler secret put ADMIN_KEY',
+        },
         { status: 503 },
       ),
     };

@@ -31,14 +31,17 @@ UnfilteredHub sits between your devices and upstream DNS resolvers. Every DNS qu
 | **DNS Proxy** | Multi-upstream failover | Cloudflare DNS, Google DNS, Quad9 with adaptive EMA scoring |
 | **DNS Proxy** | DNSSEC pass-through | AD flag preserved from upstream; DO flag forwarded and cache-isolated |
 | **Blocking** | Embedded core blocklist | ~300 domains (ads, trackers, malware, crypto miners, telemetry) |
-| **Blocking** | KV extended blocklist | Add/remove domains via Admin API; supports 80K+ entries |
+| **Blocking** | KV snapshot blocklist | Single-key snapshot, loaded to memory every 5 min — zero per-query KV reads |
+| **Blocking** | Allowlist override | `@domain` entries always resolve, even if a parent is blocked |
 | **Blocking** | Subdomain matching | `ads.example.com` blocked if `example.com` is in the list |
-| **Cache** | Cloudflare Cache API | TTL extracted from upstream response, clamped to 60s–3600s |
-| **Cache** | DNSSEC-aware keys | `do=0` and `do=1` cached separately to prevent AD flag mismatch |
-| **Abuse** | Per-IP rate limiting | 200 queries/min, KV-backed, 5-min block on exceed |
+| **Cache** | JSON **and wireformat** | Both `?name=` and `?dns=`/POST paths cached (real DoH clients use wireformat) |
+| **Cache** | DNS transaction ID rewrite | Cached wire responses are re-stamped with each client's own query ID |
+| **Cache** | TTL from upstream | Positive: clamped 60s–3600s; negative (NXDOMAIN/NODATA): 30s–300s |
+| **Cache** | DNSSEC-aware keys | `do` and `cd` flags are part of the cache key to prevent AD flag mismatch |
+| **Abuse** | Per-IP rate limiting | 200 queries/min, **in-memory** (zero KV cost), 5-min block on exceed |
 | **Abuse** | DGA detection | Shannon entropy + vowel heuristic on leftmost label |
 | **Abuse** | Dangerous type blocking | ANY, CHAOS, oversized TXT refused with RCODE=5 |
-| **Stats** | Sampled daily counters | Total, blocked, cached, abused — 1-in-10 sampling for KV budget |
+| **Stats** | Buffered daily counters | Exact in-memory counts, flushed to KV at most every 5 min per isolate |
 | **UI** | Landing page | Dark theme, TR/EN, feature showcase, live impact widget |
 | **UI** | Setup wizard | 3-step guide with QR code, device detection, connection test |
 | **UI** | Admin dashboard | Login, stats cards, 7-day chart, KV blocklist CRUD |
@@ -57,13 +60,16 @@ UnfilteredHub sits between your devices and upstream DNS resolvers. Every DNS qu
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/AliAnilworker/unfilteredhub-doh.git
-cd unfilteredhub-doh && npm install
+git clone https://github.com/hamzaciftci/unfiltered-hub.git
+cd unfiltered-hub && npm install
 
-# 2. Authenticate with Cloudflare
+# 2. Run the tests (optional but recommended)
+npm test
+
+# 3. Authenticate with Cloudflare
 npx wrangler login
 
-# 3. Deploy
+# 4. Deploy
 npx wrangler deploy
 ```
 
@@ -86,9 +92,32 @@ curl 'https://unfilteredhub-doh.YOUR-ACCOUNT.workers.dev/dns-query?name=example.
 npx wrangler kv namespace create BLOCKLIST
 # Add the returned ID to wrangler.toml under [[kv_namespaces]]
 npx wrangler secret put ADMIN_KEY
-# Enter a strong key (e.g. openssl rand -hex 32)
+# Enter a strong key (min 16 chars — e.g. openssl rand -hex 32).
+# Weak/default keys (test-secret-123, changeme, password, ...) are
+# REJECTED at runtime: the admin API stays disabled until a real
+# secret is set. Never put ADMIN_KEY in wrangler.toml.
 npx wrangler deploy
 ```
+
+**Local development secrets:** copy `.dev.vars.example` to `.dev.vars` and
+fill in `ADMIN_KEY`. `.dev.vars` is gitignored; `wrangler dev` picks it up
+automatically. Production always uses `wrangler secret put ADMIN_KEY`.
+
+## Cloudflare Free Tier Budget
+
+This project is explicitly engineered to fit the Workers free tier:
+
+| Limit (free tier) | Budget | How it's respected |
+|---|---|---|
+| 1,000 KV **writes**/day | Stats flush only | Abuse/rate-limit: 0 writes (in-memory). Stats: buffered, ≤1 write / 5 min / isolate (~288/day worst case). Admin ops: 1 write per mutation. |
+| 100,000 KV **reads**/day | 1 read / 5 min / isolate | Blocklist is a single snapshot key cached in memory; DNS queries never read KV directly. |
+| 100,000 requests/day | — | Typical personal DoH usage: 5–20k queries/day; the Cache API absorbs repeats. |
+| 10 ms CPU/request | — | Hot path is Set lookups + header parsing. Snapshot parse (~30k domains) happens once per 5 min in the background (stale-while-revalidate). Keep the imported snapshot ≤ ~30k entries (`MAX_DOMAINS` in the import script). |
+
+Trade-offs made for the free tier (documented, deliberate):
+- Rate limiting is **per-isolate**: an attacker spread across many PoPs gets N× the per-minute cap. Each isolate still blocks independently, and KV's ~60s eventual consistency made the old KV-based limiter no stricter in practice.
+- Stats are **eventually written**: an isolate that dies before its 5-minute flush loses that buffer (undercount, never overcount).
+- Blocklist changes propagate to all isolates **within 5 minutes** (the snapshot TTL); the isolate serving the admin request updates instantly.
 
 ## Security Model
 
@@ -113,7 +142,7 @@ npx wrangler deploy
 
 Query-parameter auth (`?key=`) is explicitly rejected to prevent key leakage in access logs.
 
-**KV failure behavior:** All DNS-critical paths fail-open. If KV is unavailable, rate limiting and extended blocklist are disabled but DNS resolution continues using the embedded core blocklist.
+**KV failure behavior:** All DNS-critical paths fail-open. If KV is unavailable, the extended blocklist snapshot and stats are skipped but DNS resolution continues using the embedded core blocklist. Rate limiting is unaffected — it is fully in-memory.
 
 ## Abuse Protection
 
@@ -127,11 +156,18 @@ The `/dns-query` endpoint is public. Three layers protect against misuse:
 
 DGA-flagged queries are allowed but marked `suspicious`. They are not blocked on first occurrence.
 
-**Layer 3 — Per-IP rate limiting.** KV-backed counters enforce:
+**Layer 3 — Per-IP rate limiting (in-memory).** Per-isolate counters enforce:
 - 200 queries/min hard cap — exceed triggers a 5-minute IP block
 - 3 suspicious queries/min — exceed triggers a 5-minute IP block
 
-Blocked IPs receive HTTP 429 with `Retry-After` header. Rate limit state auto-expires via KV TTL.
+Blocked IPs receive HTTP 429 with `Retry-After` header.
+
+**Why in-memory instead of KV?** KV allows only 1,000 writes/day on the free
+tier — a per-query counter burns through that in hours and silently disables
+protection. KV is also eventually consistent (~60s), which makes sub-minute
+windows unreliable anyway. In-memory buckets are exact within an isolate,
+cost nothing, and a given client IP is routed to the same PoP in practice.
+Memory is bounded (10k tracked IPs per isolate, LRU eviction).
 
 All abuse responses use DNS REFUSED (RCODE=5), not NXDOMAIN, so clients can distinguish "query refused" from "domain does not exist."
 
@@ -196,9 +232,10 @@ src/
 ├── resolver.ts        Multi-upstream with adaptive EMA scoring
 ├── blocker.ts         Domain matching, NXDOMAIN response builders
 ├── blocklist.ts       Embedded ~300-domain Set
-├── abuse.ts           Rate limiting, DGA detection, type blocking
-├── cache.ts           Cache API read/write with DNSSEC-aware keys
-├── stats.ts           Sampled KV counters (1-in-10)
+├── abuse.ts           In-memory rate limiting, DGA detection, type blocking
+├── cache.ts           Cache API read/write (JSON + wireformat, ID rewrite)
+├── dnsWire.ts         DNS wireformat parse/build helpers (question, TTL, EDNS)
+├── stats.ts           Buffered KV counters (flush every 5 min)
 ├── utils.ts           Shared: escHtml, getClientIp, detectLang, DNS headers
 ├── admin.ts           Admin API routing (stats, blocklist CRUD)
 ├── adminAuth.ts       Auth pipeline (API key, HMAC, IP whitelist)
@@ -216,14 +253,13 @@ src/
 
 ## Limitations
 
-- **Cloudflare Workers free tier**: 100,000 requests/day, 10ms CPU/request, 1,000 KV writes/day. Sufficient for personal use (one household). Not designed for public resolver scale.
-- **KV write budget**: With 10x sampling, stats + abuse counters support ~10,000 queries/day before hitting the 1,000 KV writes/day free limit. Paid Workers removes this constraint.
-- **No KV = degraded protection**: Without KV configured, rate limiting, extended blocklist, and stats are all disabled. The core embedded blocklist and upstream resolution still work.
-- **Cache does not cover wireformat**: Only JSON-format DNS queries are cached. Wireformat (binary) queries always go to upstream. This is by design — wireformat responses are harder to parse for TTL extraction.
+- **Cloudflare Workers free tier**: 100,000 requests/day, 10ms CPU/request, 1,000 KV writes/day. Sufficient for personal use (one household). Not designed for public resolver scale. See the *Cloudflare Free Tier Budget* section for how each limit is respected.
+- **No KV = reduced features**: Without KV configured, the extended blocklist snapshot and persisted stats are disabled. Rate limiting (in-memory), the core embedded blocklist, caching, and upstream resolution all still work.
+- **Rate limiting is per-isolate**: In-memory counters are exact within one isolate but not shared globally. A distributed attacker gets a multiple of the per-minute cap; each isolate still blocks independently.
 - **Android Private DNS limitation**: Android's native Private DNS uses DNS-over-TLS (DoT), which Cloudflare Workers cannot serve. Android users must use app-level DoH (Chrome, Firefox, Intra) or the setup wizard's guide.
-- **No manual cache purge endpoint**: Cached DNS entries expire naturally via TTL (60s–3600s). There is no admin endpoint to force-purge a cached entry.
-- **Stats are estimates**: The 1-in-10 sampling means reported numbers are `actual_count * 10`. Precision is traded for KV write budget.
-- **Single-region KV consistency**: KV is eventually consistent. Rate limit counters may allow brief bursts above threshold during cross-region propagation (~60s window).
+- **No manual cache purge endpoint**: Cached DNS entries expire naturally via TTL (positive 60s–3600s, negative 30s–300s). There is no admin endpoint to force-purge a cached entry. Newly blocked domains stop resolving immediately (the blocklist is checked before the cache), but unblocked domains may serve a cached answer until TTL expiry.
+- **Stats undercount slightly**: Counters buffer in memory and flush every 5 minutes; an isolate that dies before flushing loses its buffer. Counts are exact otherwise (no sampling).
+- **Blocklist propagation delay**: Snapshot changes reach all isolates within the 5-minute snapshot TTL.
 
 ## Production Checklist
 

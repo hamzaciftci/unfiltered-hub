@@ -60,6 +60,11 @@ const DEFAULT_LATENCY = 50;     // Initial assumed latency
 
 const statsMap = new Map<string, ResolverStats>();
 
+/** Test helper — clear adaptive scoring state. */
+export function resetResolverStats(): void {
+  statsMap.clear();
+}
+
 function getStats(name: string): ResolverStats {
   let s = statsMap.get(name);
   const now = Date.now();

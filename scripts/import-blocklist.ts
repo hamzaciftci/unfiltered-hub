@@ -1,20 +1,25 @@
 /**
  * UnfilteredHub — Blocklist Import Script
  *
- * Fetches popular blocklists and imports domains into Cloudflare KV.
+ * Fetches popular blocklists and writes them into Cloudflare KV as a
+ * SINGLE snapshot value (key: bl:snapshot:v1, one domain per line).
+ * The worker loads this snapshot into memory once per ~5 minutes per
+ * isolate — this is what keeps per-query KV reads at zero.
  *
  * Usage:
  *   npx tsx scripts/import-blocklist.ts
  *
  * Prerequisites:
  *   - npm install -D tsx
- *   - npx wrangler login
  *   - KV namespace created (see wrangler.toml)
  *
  * Environment:
  *   KV_NAMESPACE_ID  — your KV namespace ID (from wrangler.toml or dashboard)
  *   CF_ACCOUNT_ID    — your Cloudflare account ID
  *   CF_API_TOKEN     — Cloudflare API token with Workers KV write access
+ *   MAX_DOMAINS      — optional cap (default 30000). The worker parses the
+ *                      snapshot on cold refresh; on the free tier's CPU
+ *                      budget ~30k entries is a safe upper bound.
  */
 
 const BLOCKLIST_SOURCES = [
@@ -79,38 +84,36 @@ async function fetchBlocklist(source: typeof BLOCKLIST_SOURCES[0]): Promise<stri
   return domains;
 }
 
-async function writeToKV(
+const SNAPSHOT_KEY = 'bl:snapshot:v1';
+
+async function writeSnapshotToKV(
   domains: string[],
   accountId: string,
   namespaceId: string,
   apiToken: string,
 ): Promise<void> {
-  // Cloudflare KV bulk write API: max 10,000 key-value pairs per request
-  const BATCH_SIZE = 10000;
+  // Single snapshot value: one domain per line ("@domain" = allowlist).
+  // KV value limit is 25 MB — 30k domains ≈ 0.6 MB, comfortably within it.
+  const snapshot = domains.join('\n');
 
-  for (let i = 0; i < domains.length; i += BATCH_SIZE) {
-    const batch = domains.slice(i, i + BATCH_SIZE);
-    const body = batch.map((d) => ({ key: d, value: '1' }));
-
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`,
-      {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${apiToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${encodeURIComponent(SNAPSHOT_KEY)}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${apiToken}`,
+        'Content-Type': 'text/plain',
       },
-    );
+      body: snapshot,
+    },
+  );
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`KV bulk write failed (batch ${i / BATCH_SIZE + 1}): ${err}`);
-    }
-
-    console.log(`  Written batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} domains)`);
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`KV snapshot write failed: ${err}`);
   }
+
+  console.log(`  Snapshot written: ${domains.length} domains, ${(snapshot.length / 1024).toFixed(0)} KB (1 KV write)`);
 }
 
 async function main() {
@@ -143,13 +146,22 @@ async function main() {
 
   console.log(`\nTotal unique domains: ${allDomains.size}`);
 
-  // Write to KV
-  console.log('\nWriting to Cloudflare KV...\n');
-  const domainArray = Array.from(allDomains);
-  await writeToKV(domainArray, accountId, namespaceId, apiToken);
+  // Cap the snapshot — the worker parses it in memory on refresh, and the
+  // free tier CPU budget favors keeping it bounded.
+  const maxDomains = parseInt(process.env.MAX_DOMAINS || '30000', 10);
+  let domainArray = Array.from(allDomains);
+  if (domainArray.length > maxDomains) {
+    console.log(`Capping to MAX_DOMAINS=${maxDomains} (was ${domainArray.length}).`);
+    domainArray = domainArray.slice(0, maxDomains);
+  }
+
+  // Write single snapshot to KV
+  console.log('\nWriting snapshot to Cloudflare KV...\n');
+  await writeSnapshotToKV(domainArray, accountId, namespaceId, apiToken);
 
   console.log('\n==========================================');
-  console.log(`  Import complete! ${allDomains.size} domains imported.`);
+  console.log(`  Import complete! ${domainArray.length} domains in snapshot.`);
+  console.log('  Worker isolates pick it up within ~5 minutes.');
   console.log('==========================================');
 }
 

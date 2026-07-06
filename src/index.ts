@@ -9,40 +9,56 @@
 import { generateLandingPage } from './landing';
 import { generateMobileConfig } from './apple-profile';
 import { generateAndroidGuide, generateAndroidConfig } from './android-profile';
-import { isBlocked, buildBlockedJsonResponse, buildBlockedWireResponse, parseDomainFromWire } from './blocker';
+import { isBlocked, buildBlockedJsonResponse, buildBlockedWireResponse } from './blocker';
 import { handleAdmin } from './admin';
-import { getCachedResponse, cacheResponse } from './cache';
+import {
+  getCachedResponse,
+  cacheResponse,
+  getCachedWireResponse,
+  cacheWireResponse,
+  type WireCacheKeyParts,
+} from './cache';
 import { recordQuery } from './stats';
 import { resolveJson, resolveWireGet, resolveWirePost, getUpstreams } from './resolver';
-import { checkJsonAbuse, checkWireAbuse, recordDnsQuery } from './abuse';
+import { checkJsonAbuse, checkWireAbuse } from './abuse';
 import { handleWhoAmI } from './whoami';
 import { handleBlocklistPage, handleBlocklistTxt, handleBlocklistJson } from './blocklistViewer';
 import { handleTransparency } from './transparency';
 import { generateSetupPage } from './setup';
 import { handleImpactApi } from './impactWidget';
 import { getClientIp, detectLang, dnsWireHeaders, dnsJsonHeaders } from './utils';
+import { decodeDnsParam, parseQuestion, parseCdFlag, parseEdnsDoFlag } from './dnsWire';
 
 export interface Env {
   BLOCKLIST?: KVNamespace;
   ADMIN_KEY?: string;
   ADMIN_ALLOWED_IPS?: string;
   UPSTREAM?: string;
+  VERSION?: string;
+  BUILD_TIME?: string;
 }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Accept, X-API-Key',
-        },
-      });
+      // CORS preflight is only meaningful for the public DoH endpoint.
+      // Admin/dashboard calls are same-origin and need no CORS.
+      if (url.pathname === '/dns-query') {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Accept',
+            'Access-Control-Max-Age': '86400',
+          },
+        });
+      }
+      return new Response(null, { status: 204, headers: { Allow: 'GET, POST, OPTIONS' } });
     }
 
-    const url = new URL(request.url);
     const upstreams = getUpstreams(env.UPSTREAM);
 
     // ── Lightweight endpoints (no KV, no DNS) ──
@@ -165,6 +181,68 @@ async function handleDnsGet(
   return new Response('Missing dns or name parameter', { status: 400 });
 }
 
+/* ── Shared wireformat pipeline (GET ?dns= and POST) ───── */
+
+/**
+ * Common wire path: abuse check → blocklist → cache → upstream → cache-fill.
+ * `resolve` performs the upstream fetch on cache miss.
+ */
+async function handleWireQuery(
+  queryBuffer: ArrayBuffer,
+  clientIp: string,
+  env: Env,
+  ctx: ExecutionContext,
+  resolve: () => Promise<{ response: Response; resolver: string; scoreHeader: string }>,
+): Promise<Response> {
+  const question = parseQuestion(queryBuffer);
+  const queryDomain = question && question.qname.length > 0 ? question.qname : null;
+
+  // 1. Abuse protection — synchronous, in-memory, checks AND records
+  const abuse = checkWireAbuse(clientIp, queryDomain, queryBuffer);
+  if (!abuse.allowed) {
+    ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false, abused: true }));
+    return abuse.response!;
+  }
+
+  // 2. Blocklist
+  if (queryDomain && await isBlocked(queryDomain, env.BLOCKLIST)) {
+    ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: true, cached: false }));
+    return buildBlockedWireResponse(queryBuffer);
+  }
+
+  // 3. Cache lookup (only for parseable questions)
+  let cacheParts: WireCacheKeyParts | null = null;
+  if (question) {
+    cacheParts = {
+      qname: question.qname,
+      qtype: question.qtype,
+      qclass: question.qclass,
+      dnssecOk: parseEdnsDoFlag(queryBuffer),
+      cdFlag: parseCdFlag(queryBuffer),
+    };
+    const hit = await getCachedWireResponse(cacheParts, queryBuffer);
+    if (hit) {
+      ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: true }));
+      return hit;
+    }
+  }
+
+  // 4. Upstream resolve
+  ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false }));
+  const { response: res, resolver, scoreHeader } = await resolve();
+
+  // 5. Buffer the body so we can cache it and return it
+  const body = await res.arrayBuffer();
+  if (cacheParts && res.ok) {
+    ctx.waitUntil(cacheWireResponse(cacheParts, body));
+  }
+
+  return new Response(body, {
+    status: res.status,
+    headers: dnsWireHeaders(resolver, scoreHeader, abuse.flag),
+  });
+}
+
 /* ── Wireformat GET (?dns=) ────────────────────────────── */
 
 async function handleWireGet(
@@ -174,45 +252,24 @@ async function handleWireGet(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  let decoded: Uint8Array | null = null;
-  let queryDomain: string | null = null;
+  const queryBuffer = decodeDnsParam(dnsParam);
 
-  try {
-    decoded = Uint8Array.from(
-      atob(dnsParam.replace(/-/g, '+').replace(/_/g, '/')),
-      (c) => c.charCodeAt(0),
-    );
-    queryDomain = parseDomainFromWire(decoded.buffer);
-  } catch {
-    // Decoding failed — pass through to upstream
+  if (!queryBuffer) {
+    // Undecodable base64 — still rate-limit the caller, then pass through
+    const abuse = checkWireAbuse(clientIp, null, new ArrayBuffer(0));
+    if (!abuse.allowed) return abuse.response!;
+
+    ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false }));
+    const { response: res, resolver, scoreHeader } = await resolveWireGet(dnsParam, upstreams);
+    return new Response(res.body, {
+      status: res.status,
+      headers: dnsWireHeaders(resolver, scoreHeader, abuse.flag),
+    });
   }
 
-  let abuseFlag = 'clean';
-
-  if (decoded) {
-    const abuse = await checkWireAbuse(clientIp, queryDomain, decoded.buffer, env.BLOCKLIST);
-    abuseFlag = abuse.flag;
-
-    if (!abuse.allowed) {
-      ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, true, abuse._record));
-      ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false, abused: true }));
-      return abuse.response!;
-    }
-
-    ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, abuseFlag === 'suspicious', abuse._record));
-
-    if (queryDomain && await isBlocked(queryDomain, env.BLOCKLIST)) {
-      ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: true, cached: false }));
-      return buildBlockedWireResponse(decoded.buffer);
-    }
-  }
-
-  ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false }));
-  const { response: res, resolver, scoreHeader } = await resolveWireGet(dnsParam, upstreams);
-  return new Response(res.body, {
-    status: res.status,
-    headers: dnsWireHeaders(resolver, scoreHeader, abuseFlag),
-  });
+  return handleWireQuery(queryBuffer, clientIp, env, ctx, () =>
+    resolveWireGet(dnsParam, upstreams),
+  );
 }
 
 /* ── JSON GET (?name=&type=) ───────────────────────────── */
@@ -226,27 +283,27 @@ async function handleJsonGet(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  const abuse = await checkJsonAbuse(clientIp, name, type, env.BLOCKLIST);
-
+  // 1. Abuse protection — synchronous, in-memory, checks AND records
+  const abuse = checkJsonAbuse(clientIp, name, type);
   if (!abuse.allowed) {
-    ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, true, abuse._record));
     ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false, abused: true }));
     return abuse.response!;
   }
 
-  ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, abuse.flag === 'suspicious', abuse._record));
-
+  // 2. Blocklist
   if (await isBlocked(name, env.BLOCKLIST)) {
     ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: true, cached: false }));
     return buildBlockedJsonResponse();
   }
 
+  // 3. Cache
   const cached = await getCachedResponse(name, type, dnssecOk);
   if (cached) {
     ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: true }));
     return cached;
   }
 
+  // 4. Upstream resolve + cache fill
   const { body, response: res, resolver, scoreHeader } = await resolveJson(name, type, upstreams, dnssecOk);
   ctx.waitUntil(cacheResponse(name, type, res, body, dnssecOk));
   ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false }));
@@ -266,27 +323,7 @@ async function handleDnsPost(
   ctx: ExecutionContext,
 ): Promise<Response> {
   const body = await request.arrayBuffer();
-  const queryDomain = parseDomainFromWire(body);
-
-  const abuse = await checkWireAbuse(clientIp, queryDomain, body, env.BLOCKLIST);
-
-  if (!abuse.allowed) {
-    ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, true, abuse._record));
-    ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false, abused: true }));
-    return abuse.response!;
-  }
-
-  ctx.waitUntil(recordDnsQuery(clientIp, env.BLOCKLIST, abuse.flag === 'suspicious', abuse._record));
-
-  if (queryDomain && await isBlocked(queryDomain, env.BLOCKLIST)) {
-    ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: true, cached: false }));
-    return buildBlockedWireResponse(body);
-  }
-
-  ctx.waitUntil(recordQuery(env.BLOCKLIST, { blocked: false, cached: false }));
-  const { response: res, resolver, scoreHeader } = await resolveWirePost(body, upstreams);
-  return new Response(res.body, {
-    status: res.status,
-    headers: dnsWireHeaders(resolver, scoreHeader, abuse.flag),
-  });
+  return handleWireQuery(body, clientIp, env, ctx, () =>
+    resolveWirePost(body, upstreams),
+  );
 }
