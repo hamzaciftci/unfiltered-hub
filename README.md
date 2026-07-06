@@ -1,6 +1,22 @@
-# UnfilteredHub
+<div align="center">
 
-> **[Turkce dokumantasyon icin / For Turkish documentation: README.tr.md](README.tr.md)**
+<img src="assets/banner.svg" alt="UnfilteredHub — Self-hosted DNS-over-HTTPS on Cloudflare Workers" width="100%">
+
+<br>
+
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
+[![Tests](https://img.shields.io/badge/tests-49%20passing-2ea44f?logo=vitest&logoColor=white)](test/)
+[![RFC 8484](https://img.shields.io/badge/RFC-8484-5865F2)](https://datatracker.ietf.org/doc/html/rfc8484)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+**English** · [Türkçe](README.tr.md)
+
+[Quick Start](#quick-start) · [Features](#features) · [Free Tier Budget](#cloudflare-free-tier-budget) · [Security Model](#security-model) · [Architecture](#architecture)
+
+</div>
+
+---
 
 A self-hosted DNS-over-HTTPS proxy on Cloudflare Workers that encrypts your DNS queries, blocks ads and trackers, and gives you full control over your DNS resolution.
 

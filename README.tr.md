@@ -1,6 +1,22 @@
-# UnfilteredHub
+<div align="center">
 
-> **[English documentation / Ingilizce dokumantasyon: README.md](README.md)**
+<img src="assets/banner.svg" alt="UnfilteredHub — Cloudflare Workers uzerinde kendi DNS-over-HTTPS sunucun" width="100%">
+
+<br>
+
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
+[![Testler](https://img.shields.io/badge/testler-49%20geciyor-2ea44f?logo=vitest&logoColor=white)](test/)
+[![RFC 8484](https://img.shields.io/badge/RFC-8484-5865F2)](https://datatracker.ietf.org/doc/html/rfc8484)
+[![Lisans: MIT](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
+
+[English](README.md) · **Türkçe**
+
+[Hizli Baslangic](#hizli-baslangic) · [Ozellikler](#ozellikler) · [Ucretsiz Katman Butcesi](#cloudflare-ucretsiz-katman-butcesi) · [Guvenlik Modeli](#guvenlik-modeli)
+
+</div>
+
+---
 
 Cloudflare Workers uzerinde calisan, kendi kendine barindirabileceginiz bir DNS-over-HTTPS (DoH) proxy'si. DNS sorgularinizi sifreler, reklam ve izleyicileri engeller, DNS cozumlemesi uzerinde tam kontrol saglar.
 
