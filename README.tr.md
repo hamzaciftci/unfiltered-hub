@@ -1,6 +1,22 @@
-# UnfilteredHub
+<div align="center">
 
-> **[English documentation / Ingilizce dokumantasyon: README.md](README.md)**
+<img src="assets/banner.svg" alt="UnfilteredHub — Cloudflare Workers uzerinde kendi DNS-over-HTTPS sunucun" width="100%">
+
+<br>
+
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
+[![Testler](https://img.shields.io/badge/testler-49%20geciyor-2ea44f?logo=vitest&logoColor=white)](test/)
+[![RFC 8484](https://img.shields.io/badge/RFC-8484-5865F2)](https://datatracker.ietf.org/doc/html/rfc8484)
+[![Lisans: MIT](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
+
+[English](README.md) · **Türkçe**
+
+[Hizli Baslangic](#hizli-baslangic) · [Ozellikler](#ozellikler) · [Ucretsiz Katman Butcesi](#cloudflare-ucretsiz-katman-butcesi) · [Guvenlik Modeli](#guvenlik-modeli)
+
+</div>
+
+---
 
 Cloudflare Workers uzerinde calisan, kendi kendine barindirabileceginiz bir DNS-over-HTTPS (DoH) proxy'si. DNS sorgularinizi sifreler, reklam ve izleyicileri engeller, DNS cozumlemesi uzerinde tam kontrol saglar.
 
@@ -31,14 +47,17 @@ UnfilteredHub, cihazlariniz ile ust DNS saglayicilari arasinda bir katman olarak
 | **DNS Proxy** | Coklu ust DNS yedekleme | Cloudflare DNS, Google DNS, Quad9 — adaptif EMA puanlamasi |
 | **DNS Proxy** | DNSSEC gecisi | AD bayragi ust DNS saglayicisidan korunur; DO bayragi iletilir ve onbellek izole edilir |
 | **Engelleme** | Gomulu cekirdek engelleme listesi | ~300 alan adi (reklamlar, izleyiciler, zararli yazilimlar, kripto madencileri, telemetri) |
-| **Engelleme** | KV genisletilmis engelleme listesi | Admin API uzerinden alan adi ekle/kaldir; 80.000'den fazla girdi destekler |
+| **Engelleme** | KV snapshot engelleme listesi | Tek anahtarlik snapshot, 5 dakikada bir bellege yuklenir — sorgu basina SIFIR KV okuma |
+| **Engelleme** | Allowlist (izin listesi) | `@alanadi` girdileri her zaman cozumlenir, ust alan engelli olsa bile |
 | **Engelleme** | Alt alan adi eslestirme | `example.com` listede ise `ads.example.com` da engellenir |
-| **Onbellek** | Cloudflare Cache API | TTL ust DNS yanitindan cikarilir, 60s-3600s araliginda sinirlandirilir |
-| **Onbellek** | DNSSEC duyarli anahtarlar | `do=0` ve `do=1` ayri onbelleklenir, AD bayragi uyumsuzlugu onlenir |
-| **Kotuye Kullanim** | IP bazli hiz sinirlandirma | 200 sorgu/dk, KV destekli, asimda 5 dakika engelleme |
+| **Onbellek** | JSON **ve wireformat** | Hem `?name=` hem `?dns=`/POST yollari onbelleklenir (gercek DoH istemcileri wireformat kullanir) |
+| **Onbellek** | DNS transaction ID yeniden yazimi | Onbellekten donen wire yanitlar her istemcinin kendi sorgu ID'siyle damgalanir |
+| **Onbellek** | TTL ust DNS'ten | Pozitif: 60s-3600s; negatif (NXDOMAIN/NODATA): 30s-300s |
+| **Onbellek** | DNSSEC duyarli anahtarlar | `do` ve `cd` bayraklari onbellek anahtarinin parcasi, AD bayragi uyumsuzlugu onlenir |
+| **Kotuye Kullanim** | IP bazli hiz sinirlandirma | 200 sorgu/dk, **bellek ici** (sifir KV maliyeti), asimda 5 dakika engelleme |
 | **Kotuye Kullanim** | DGA algilama | Shannon entropisi + unlu harf sezgiseli (en soldaki etiket uzerinde) |
 | **Kotuye Kullanim** | Tehlikeli tur engelleme | ANY, CHAOS, buyuk TXT sorgusu RCODE=5 ile reddedilir |
-| **Istatistikler** | Orneklemeli gunluk sayaclar | Toplam, engellenen, onbellekten, kotuye kullanilan — KV butcesi icin 1/10 ornekleme |
+| **Istatistikler** | Tamponlanmis gunluk sayaclar | Bellekte kesin sayim, isolate basina en fazla 5 dakikada bir KV'ye yazilir |
 | **Arayuz** | Acilis sayfasi | Koyu tema, TR/EN, ozellik vitrinleri, canli etki widget'i |
 | **Arayuz** | Kurulum sihirbazi | 3 adimli rehber, QR kodu, cihaz algilama, baglanti testi |
 | **Arayuz** | Yonetim paneli | Giris, istatistik kartlari, 7 gunluk grafik, KV engelleme listesi CRUD |
@@ -57,13 +76,16 @@ UnfilteredHub, cihazlariniz ile ust DNS saglayicilari arasinda bir katman olarak
 
 ```bash
 # 1. Klonla ve kur
-git clone https://github.com/AliAnilworker/unfilteredhub-doh.git
-cd unfilteredhub-doh && npm install
+git clone https://github.com/hamzaciftci/unfiltered-hub.git
+cd unfiltered-hub && npm install
 
-# 2. Cloudflare ile kimlik dogrulamasi yap
+# 2. Testleri calistir (istege bagli ama onerilir)
+npm test
+
+# 3. Cloudflare ile kimlik dogrulamasi yap
 npx wrangler login
 
-# 3. Dagit
+# 4. Dagit
 npx wrangler deploy
 ```
 
@@ -86,9 +108,33 @@ curl 'https://unfilteredhub-doh.YOUR-ACCOUNT.workers.dev/dns-query?name=example.
 npx wrangler kv namespace create BLOCKLIST
 # Donen ID'yi wrangler.toml dosyasindaki [[kv_namespaces]] altina ekleyin
 npx wrangler secret put ADMIN_KEY
-# Guclu bir anahtar girin (ornegin: openssl rand -hex 32)
+# Guclu bir anahtar girin (en az 16 karakter — ornegin: openssl rand -hex 32).
+# Zayif/varsayilan anahtarlar (test-secret-123, changeme, password vb.)
+# runtime'da REDDEDILIR: gercek bir secret ayarlanana kadar admin API
+# kapali kalir. ADMIN_KEY'i asla wrangler.toml'a yazmayin.
 npx wrangler deploy
 ```
+
+**Lokal gelistirme secret'lari:** `.dev.vars.example` dosyasini `.dev.vars`
+olarak kopyalayin ve `ADMIN_KEY` degerini doldurun. `.dev.vars` git'e
+commitlenmez; `wrangler dev` otomatik okur. Production'da her zaman
+`wrangler secret put ADMIN_KEY` kullanilir.
+
+## Cloudflare Ucretsiz Katman Butcesi
+
+Bu proje Workers ucretsiz katmanina sigacak sekilde tasarlanmistir:
+
+| Limit (ucretsiz katman) | Butce | Nasil korunuyor |
+|---|---|---|
+| Gunde 1.000 KV **yazma** | Sadece stats flush | Abuse/rate-limit: 0 yazma (bellek ici). Stats: tamponlu, isolate basina ≤1 yazma / 5 dk (en kotu ~288/gun). Admin islemleri: mutasyon basina 1 yazma. |
+| Gunde 100.000 KV **okuma** | Isolate basina 5 dk'da 1 okuma | Engelleme listesi tek snapshot anahtari olarak bellekte tutulur; DNS sorgulari KV'yi hic okumaz. |
+| Gunde 100.000 istek | — | Tipik kisisel DoH kullanimi gunde 5-20 bin sorgudur; Cache API tekrarlari emer. |
+| Istek basina 10 ms CPU | — | Sicak yol Set aramasi + baslik ayrisimidir. Snapshot ayristirma (~30 bin alan adi) 5 dakikada bir arka planda olur (stale-while-revalidate). Iceri aktarilan snapshot'i ~30 bin girdinin altinda tutun (import scriptindeki `MAX_DOMAINS`). |
+
+Ucretsiz katman icin bilincli odunler:
+- Hiz sinirlandirma **isolate basina** calisir: cok sayida PoP'a yayilan bir saldirgan limitin N katini alabilir. Yine de her isolate bagimsiz engeller; eski KV tabanli tasarim da ~60 sn eventual consistency nedeniyle pratikte daha siki degildi.
+- Istatistikler **eninde sonunda** yazilir: 5 dakikalik flush'tan once olen isolate o tamponu kaybeder (eksik sayim olabilir, fazla sayim asla).
+- Engelleme listesi degisiklikleri tum isolate'lara **5 dakika icinde** yayilir (snapshot TTL); admin istegini isleyen isolate aninda gunceller.
 
 ## Guvenlik Modeli
 
@@ -127,11 +173,19 @@ Sorgu parametresi ile kimlik dogrulama (`?key=`) erisim kayitlarinda anahtar siz
 
 DGA ile isaretlenen sorgular gecis verilir ancak `suspicious` (supheli) olarak isaretlenir. Ilk olusumda engellenmezler.
 
-**Katman 3 — IP bazli hiz sinirlandirma.** KV destekli sayaclarla uygulanir:
+**Katman 3 — IP bazli hiz sinirlandirma (bellek ici).** Isolate basina sayaclarla uygulanir:
 - 200 sorgu/dk kesin sinir — asimda 5 dakikalik IP engellemesi tetiklenir
 - 3 supheli sorgu/dk — asimda 5 dakikalik IP engellemesi tetiklenir
 
-Engellenen IP'ler `Retry-After` basligina sahip HTTP 429 yaniti alir. Hiz siniri durumu KV TTL ile otomatik olarak sona erer.
+Engellenen IP'ler `Retry-After` basligina sahip HTTP 429 yaniti alir.
+
+**Neden KV degil de bellek ici?** Ucretsiz katman gunde yalnizca 1.000 KV
+yazmaya izin verir — sorgu basina sayac bunu saatler icinde tuketir ve
+korumayi sessizce devre disi birakir. KV ayrica ~60 saniyelik nihai
+tutarlilikla calisir; dakika alti pencereleri zaten guvenilmez kilar.
+Bellek ici kovalar isolate icinde kesindir, maliyeti sifirdir ve bir
+istemci IP'si pratikte ayni PoP'a yonlendirilir. Bellek sinirlidir
+(isolate basina 10 bin IP, LRU tahliye).
 
 Tum kotuye kullanim yanitlari DNS REFUSED (RCODE=5) kullanir, NXDOMAIN degil. Boylece istemciler "sorgu reddedildi" ile "alan adi mevcut degil" arasindaki farki ayirt edebilir.
 
@@ -196,9 +250,10 @@ src/
 ├── resolver.ts        Adaptif EMA puanlamali coklu ust DNS cozumleyici
 ├── blocker.ts         Alan adi eslestirme, NXDOMAIN yanit olusturucular
 ├── blocklist.ts       Gomulu ~300 alan adili Set
-├── abuse.ts           Hiz sinirlandirma, DGA algilama, tur engelleme
-├── cache.ts           DNSSEC duyarli anahtarlarla Cache API okuma/yazma
-├── stats.ts           Orneklemeli KV sayaclari (1/10)
+├── abuse.ts           Bellek ici hiz sinirlandirma, DGA algilama, tur engelleme
+├── cache.ts           Cache API okuma/yazma (JSON + wireformat, ID yeniden yazimi)
+├── dnsWire.ts         DNS wireformat ayristirma/olusturma yardimcilari
+├── stats.ts           Tamponlanmis KV sayaclari (5 dakikada bir flush)
 ├── utils.ts           Paylasilan: escHtml, getClientIp, detectLang, DNS basliklari
 ├── admin.ts           Admin API yonlendirmesi (istatistikler, engelleme listesi CRUD)
 ├── adminAuth.ts       Kimlik dogrulama hatti (API anahtari, HMAC, IP beyaz listesi)
@@ -216,14 +271,13 @@ src/
 
 ## Sinirlamalar
 
-- **Cloudflare Workers ucretsiz katmani**: Gunde 100.000 istek, istek basina 10ms islemci suresi, gunde 1.000 KV yazma. Kisisel kullanim (bir hane) icin yeterlidir. Herkese acik cozumleyici olceginde calismak icin tasarlanmamistir.
-- **KV yazma butcesi**: 10x ornekleme ile istatistik + kotuye kullanim sayaclari, gunde 1.000 KV yazma ucretsiz limitine ulasmadan once gunde yaklasik 10.000 sorguyu destekler. Ucretli Workers bu kisitlamayi kaldirir.
-- **KV yok = zayiflayan koruma**: KV yapilandirilmadan, hiz sinirlandirma, genisletilmis engelleme listesi ve istatistiklerin tumü devre disi kalir. Gomulu cekirdek engelleme listesi ve ust DNS cozumlemesi yine de calisir.
-- **Onbellek wireformat'i kapsamaz**: Yalnizca JSON formatli DNS sorgulari onbellege alinir. Wireformat (ikili) sorgular her zaman ust DNS saglayicisina gider. Bu tasarim geregi boyledir — wireformat yanitlarindan TTL cikarimi daha zordur.
+- **Cloudflare Workers ucretsiz katmani**: Gunde 100.000 istek, istek basina 10ms islemci suresi, gunde 1.000 KV yazma. Kisisel kullanim (bir hane) icin yeterlidir. Herkese acik cozumleyici olceginde calismak icin tasarlanmamistir. Her limitin nasil korundugu icin *Cloudflare Ucretsiz Katman Butcesi* bolumune bakin.
+- **KV yok = azalan ozellikler**: KV yapilandirilmadan genisletilmis engelleme listesi snapshot'i ve kalici istatistikler devre disi kalir. Hiz sinirlandirma (bellek ici), gomulu cekirdek engelleme listesi, onbellek ve ust DNS cozumlemesi yine de calisir.
+- **Hiz sinirlandirma isolate basinadir**: Bellek ici sayaclar tek isolate icinde kesindir ama kuresel paylasilmaz. Dagitik bir saldirgan dakikalik sinirin katlarini alabilir; her isolate yine de bagimsiz engeller.
 - **Android Private DNS sinirlamasi**: Android'in yerel Private DNS ozelligi DNS-over-TLS (DoT) kullanir ve Cloudflare Workers bunu sunamaz. Android kullanicilari uygulama duzeyinde DoH (Chrome, Firefox, Intra) veya kurulum sihirbaziyla rehbere basvurmalidir.
-- **Manuel onbellek temizleme uç noktasi yoktur**: Onbellekteki DNS kayitlari TTL (60s-3600s) uzerinden dogal olarak sona erer. Onbellekteki bir kaydi zorla silmek icin yonetim uç noktasi bulunmamaktadir.
-- **Istatistikler tahmindir**: 1/10 ornekleme, raporlanan sayilarin `gercek_sayi * 10` oldugu anlamina gelir. KV yazma butcesi icin hassasiyetten odun verilmistir.
-- **Tek bolge KV tutarliligi**: KV nihai tutarlilik (eventual consistency) ile calisir. Hiz siniri sayaclari, bolgeler arasi yayilim sirasinda esik degerinin uzerinde kisa sureli artislara izin verebilir (~60 saniyelik pencere).
+- **Manuel onbellek temizleme uc noktasi yoktur**: Onbellekteki DNS kayitlari TTL uzerinden dogal olarak sona erer (pozitif 60s-3600s, negatif 30s-300s). Yeni engellenen alan adlari aninda engellenir (engelleme kontrolu onbellekten once yapilir); engeli kaldirilan alan adlari TTL bitene kadar onbellekten yanit alabilir.
+- **Istatistikler hafifce eksik sayabilir**: Sayaclar bellekte tamponlanir ve 5 dakikada bir yazilir; flush'tan once olen isolate tamponunu kaybeder. Bunun disinda sayimlar kesindir (ornekleme yok).
+- **Engelleme listesi yayilim gecikmesi**: Snapshot degisiklikleri tum isolate'lara 5 dakikalik TTL icinde ulasir.
 
 ## Uretim Kontrol Listesi
 

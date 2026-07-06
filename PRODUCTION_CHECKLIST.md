@@ -8,26 +8,25 @@
 | Upstream timeout per resolver | 3 000 ms | 30 000 ms CPU wall | OK |
 | Worst-case total latency | ~9 000 ms (3×3s) | 30 000 ms wall | OK |
 | Bundle size | 163.52 KiB (41.49 gzip) | 10 MB | OK |
-| KV reads per query | 2–3 (blocklist + abuse) | 1 000/day free | WATCH |
-| KV writes per query | 1 sampled (1-in-10) | 1 000/day free | WATCH |
+| KV reads per query | 0 (snapshot in memory; 1 read / 5 min / isolate) | 100 000/day free | OK |
+| KV writes per query | 0 (abuse in-memory; stats buffered) | 1 000/day free | OK |
 
-- [ ] **KV free-tier budget**: At 1 000 KV writes/day with 10x sampling, the ceiling is ~10 000 queries/day before writes are exhausted. Stats + abuse counters both write. Monitor daily KV usage in Cloudflare dashboard.
-- [ ] **Subrequest breakdown**: JSON cache HIT = 0 fetch, cache MISS = 1–3 upstream + 1–2 KV reads. Wire queries skip cache, always fetch upstream. Peak subrequest count ~5 — well within the 50 limit.
+- [x] **KV free-tier budget**: Abuse protection performs ZERO KV ops (in-memory buckets). Stats flush at most once per 5 min per isolate (~288 writes/day worst case). Blocklist = 1 snapshot read / 5 min / isolate. Verified by tests: 1000 queries → 0 KV writes.
+- [ ] **Subrequest breakdown**: Cache HIT (JSON or wireformat) = 0 upstream fetch. Cache MISS = 1–3 upstream fetches. Peak subrequest count ~4 — well within the 50 limit.
 - [ ] **CPU time**: All synchronous ops are sub-millisecond (Set.has, DGA entropy, wire parsing). No large loops or blocking computation.
 
 ## 2. KV Failure Behavior
 
 | Component | KV Purpose | Failure Mode | Impact |
 |-----------|-----------|--------------|--------|
-| `blocker.ts` | Extended blocklist lookup | **FAIL-OPEN** | KV domains not blocked, core list still active |
-| `abuse.ts` | Per-IP rate limit counters | **FAIL-OPEN** | No rate limiting, all queries pass |
-| `stats.ts` | Daily query counters | **FAIL-OPEN** | Stats not recorded, zero impact on DNS |
+| `blocker.ts` | Extended blocklist snapshot | **FAIL-OPEN** (stale/core list) | Last loaded snapshot stays active; core list always works |
+| `abuse.ts` | — (no KV; fully in-memory) | **N/A** | Rate limiting unaffected by KV outages |
+| `stats.ts` | Daily counter flush | **FAIL-OPEN** (re-buffered) | Counts stay in memory and flush later; zero impact on DNS |
 | `rateLimiter.ts` | Admin brute-force protection | **FAIL-OPEN** | No admin rate limiting |
 | `admin.ts` | Blocklist CRUD operations | **FAIL-CLOSED (503)** | Admin API returns 503, DNS unaffected |
 | `cache.ts` | DNS response cache | **N/A** (uses Cache API, not KV) | Falls back to upstream |
 
-- [ ] **Design decision**: All DNS-critical paths fail-open. KV outage degrades protection but never blocks legitimate DNS queries.
-- [ ] **Risk**: If KV goes down, rate limiting and extended blocklist are disabled simultaneously. An attacker could flood during a KV outage. Mitigation: Cloudflare's built-in DDoS protection at the edge.
+- [x] **Design decision**: All DNS-critical paths fail-open. KV outage degrades features but never blocks legitimate DNS queries — and no longer disables rate limiting (it is in-memory).
 - [ ] **Admin API**: Correctly fails-closed — admin ops require KV. This is expected behavior.
 
 ## 3. Cold Start Impact

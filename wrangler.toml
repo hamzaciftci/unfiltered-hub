@@ -10,12 +10,19 @@ compatibility_date = "2024-12-01"
 # binding = "BLOCKLIST"
 # id = "BURAYA_KV_NAMESPACE_ID"
 
-# ── Admin API Key ──
-# Production: npx wrangler secret put ADMIN_KEY
-# Local dev: aşağıdaki [vars] bölümünü kullanabilirsiniz.
+# ── Admin API Key (SECRET — asla bu dosyaya yazma!) ──
+# Production:
+#   npx wrangler secret put ADMIN_KEY
+#   (en az 16 karakter, rastgele bir değer kullan; örn: openssl rand -hex 24)
+#
+# Lokal geliştirme:
+#   .dev.vars.example dosyasını .dev.vars olarak kopyala ve doldur.
+#   .dev.vars git'e commitlenmez (.gitignore'da).
+#
+# NOT: Zayıf/varsayılan anahtarlar (test-secret-123, changeme, password vb.
+# veya 16 karakterden kısa) runtime'da reddedilir — admin API kapalı kalır.
 
 [vars]
-ADMIN_KEY = "test-secret-123"
 # ADMIN_ALLOWED_IPS = "1.2.3.4,5.6.7.8"  # İsteğe bağlı: Admin erişimine izin verilen IP'ler
 # UPSTREAM = "google,cloudflare,quad9"    # Varsayılan: Cloudflare → Google → Quad9
 

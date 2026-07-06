@@ -1,0 +1,18 @@
+# UnfilteredHub — lokal geliştirme değişkenleri
+# Bu dosyayı ".dev.vars" olarak kopyalayın ve değerleri doldurun:
+#   cp .dev.vars.example .dev.vars
+#
+# .dev.vars git'e COMMITLENMEZ (.gitignore'da). Production'da bu değerler
+# yerine `npx wrangler secret put ADMIN_KEY` kullanılır.
+
+# En az 16 karakter, rastgele bir değer üretin:
+#   openssl rand -hex 24
+# veya PowerShell:
+#   -join ((48..57)+(97..122) | Get-Random -Count 32 | % {[char]$_})
+ADMIN_KEY=BURAYA-EN-AZ-16-KARAKTER-RASTGELE-DEGER
+
+# İsteğe bağlı: admin API'ye erişebilecek IP'ler (virgülle ayrık)
+# ADMIN_ALLOWED_IPS=1.2.3.4
+
+# İsteğe bağlı: upstream sıralaması
+# UPSTREAM=cloudflare,google,quad9

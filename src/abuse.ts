@@ -1,17 +1,33 @@
 /**
- * UnfilteredHub — Abuse Protection
+ * UnfilteredHub — Abuse Protection (in-memory, zero KV cost)
  * Protects the public /dns-query endpoint from DNS abuse, amplification,
  * DGA-based C2, and volumetric flooding.
  *
  * Layers:
  *   1. Dangerous query type blocking (ANY, CHAOS, oversized TXT)
  *   2. DGA detection heuristic (high entropy / vowel-less long domains)
- *   3. Per-IP rate limiting (200 queries/min, KV-backed)
+ *   3. Per-IP rate limiting (200 queries/min, in-memory token window)
  *   4. Suspicious query escalation (3 suspicious in 1 min → 5 min IP block)
  *
- * Returns DNS REFUSED (RCODE=5) for abuse, never NXDOMAIN.
+ * ── Why NO KV here ──────────────────────────────────────────
+ * The previous design wrote to KV on EVERY query. Cloudflare's free tier
+ * allows only 1,000 KV writes/day — a single phone exhausts that in hours,
+ * silently disabling protection. KV is also eventually consistent (~60s),
+ * which makes sub-minute rate windows meaningless anyway.
+ *
+ * Instead, counters live in per-isolate memory:
+ *   - Exact and race-free within an isolate; zero latency, zero KV ops.
+ *   - A given client IP is routed to the same Cloudflare PoP, so in
+ *     practice one isolate sees (nearly) all of that client's traffic.
+ *   - Worst case, an attacker spread across N isolates gets N× the limit —
+ *     still bounded per isolate, and each isolate independently blocks.
+ *   - Memory is capped (LRU eviction at MAX_TRACKED_IPS entries).
+ *
+ * Returns DNS REFUSED (RCODE=5) for abuse, 429 for rate limits.
  * Adds X-Abuse-Flag header: "clean" | "suspicious" | "rate_limited"
  */
+
+import { parseQueryMeta } from './dnsWire';
 
 /* ── Types ─────────────────────────────────────────────── */
 
@@ -26,8 +42,8 @@ export interface AbuseCheckResult {
   response?: Response;
 }
 
-/** KV record for per-IP dns-query rate limiting */
-interface DnsRateLimitRecord {
+/** In-memory per-IP counters for the current window */
+interface IpBucket {
   /** Total queries in the current 60-second window */
   queryCount: number;
   /** Suspicious queries in the current 60-second window */
@@ -49,13 +65,54 @@ const QCLASS_CH = 3; // CHAOS
 
 const MAX_QUERIES_PER_MIN = 200;
 const MAX_SUSPICIOUS_PER_MIN = 3;
-const WINDOW_SEC = 60;
-const BLOCK_DURATION_SEC = 5 * 60; // 5 min
-const KV_PREFIX = 'abuse:';
+const WINDOW_MS = 60 * 1000;
+const BLOCK_DURATION_MS = 5 * 60 * 1000; // 5 min
+
+/** Memory bound: max distinct IPs tracked per isolate (LRU eviction) */
+const MAX_TRACKED_IPS = 10_000;
 
 /** DGA detection thresholds */
 const DGA_MIN_LENGTH = 25;
 const DGA_ENTROPY_THRESHOLD = 3.5;
+
+/* ── In-memory bucket store (module-level singleton) ───── */
+
+const buckets = new Map<string, IpBucket>();
+
+/** Test/ops helper — clears all in-memory abuse state. */
+export function resetAbuseState(): void {
+  buckets.clear();
+}
+
+/** Number of IPs currently tracked (for /transparency observability). */
+export function getTrackedIpCount(): number {
+  return buckets.size;
+}
+
+function getBucket(ip: string): IpBucket {
+  const t = Date.now();
+  let b = buckets.get(ip);
+
+  if (b && t - b.windowStart > WINDOW_MS && b.blockUntil <= t) {
+    // Window expired and not blocked → fresh window
+    b.queryCount = 0;
+    b.suspiciousCount = 0;
+    b.blockUntil = 0;
+    b.windowStart = t;
+  }
+
+  if (!b) {
+    b = { queryCount: 0, suspiciousCount: 0, blockUntil: 0, windowStart: t };
+    // LRU-ish eviction: Map preserves insertion order — drop the oldest entry
+    if (buckets.size >= MAX_TRACKED_IPS) {
+      const oldest = buckets.keys().next().value;
+      if (oldest !== undefined) buckets.delete(oldest);
+    }
+    buckets.set(ip, b);
+  }
+
+  return b;
+}
 
 /* ── DNS REFUSED response builders ─────────────────────── */
 
@@ -117,7 +174,7 @@ function buildRefusedWireResponse(queryBuffer: ArrayBuffer, flag: AbuseFlag): Re
   response[10] = 0;
   response[11] = 0;
 
-  return new Response(response.buffer, {
+  return new Response(response, {
     headers: {
       'Content-Type': 'application/dns-message',
       'Access-Control-Allow-Origin': '*',
@@ -129,13 +186,13 @@ function buildRefusedWireResponse(queryBuffer: ArrayBuffer, flag: AbuseFlag): Re
 /**
  * Build a rate-limited 429 response with Retry-After.
  */
-function buildRateLimitResponse(retryAfter: number): Response {
+function buildRateLimitResponse(retryAfterSec: number): Response {
   return Response.json(
     { error: 'DNS query rate limit exceeded' },
     {
       status: 429,
       headers: {
-        'Retry-After': String(retryAfter),
+        'Retry-After': String(retryAfterSec),
         'X-Abuse-Flag': 'rate_limited' as AbuseFlag,
       },
     },
@@ -199,33 +256,6 @@ export function isDGA(domain: string): boolean {
 /* ── Dangerous Query Type Detection ────────────────────── */
 
 /**
- * Parse QTYPE and QCLASS from a DNS wireformat query.
- * Returns null if parsing fails.
- */
-export function parseQueryMeta(buffer: ArrayBuffer): { qtype: number; qclass: number; querySize: number } | null {
-  const data = new Uint8Array(buffer);
-  if (data.length < 12) return null;
-
-  // Skip header (12 bytes), walk through question QNAME
-  let offset = 12;
-  while (offset < data.length) {
-    const len = data[offset];
-    if (len === 0) { offset++; break; }
-    if ((len & 0xc0) === 0xc0) { offset += 2; break; } // pointer
-    if (len > 63 || offset + 1 + len > data.length) return null;
-    offset += 1 + len;
-  }
-
-  // QTYPE (2 bytes) + QCLASS (2 bytes) follow the QNAME
-  if (offset + 4 > data.length) return null;
-
-  const qtype = (data[offset] << 8) | data[offset + 1];
-  const qclass = (data[offset + 2] << 8) | data[offset + 3];
-
-  return { qtype, qclass, querySize: buffer.byteLength };
-}
-
-/**
  * Check if a JSON-format query targets a dangerous type.
  * Returns the AbuseFlag if dangerous, null if clean.
  */
@@ -259,202 +289,100 @@ export function checkDangerousWireQuery(
   return null;
 }
 
-/* ── Per-IP Rate Limiting (KV-backed) ──────────────────── */
-
-function kvKey(ip: string): string {
-  return `${KV_PREFIX}${ip}`;
-}
+/* ── Rate limiting core (check + record in one step) ───── */
 
 /**
- * Check per-IP DNS query rate limit.
- *
- * Returns:
- *   - allowed=true, flag='clean' → proceed normally
- *   - allowed=true, flag='suspicious' → proceed but record suspicion
- *   - allowed=false → return response immediately (429 or REFUSED)
- *
- * The caller must invoke `recordDnsQuery()` after the check to persist counters.
+ * Apply the in-memory rate limit for one query and record it.
+ * `suspicious=true` also increments the escalation counter.
+ * Synchronous — no KV, no await, no waitUntil needed.
  */
-export async function checkDnsRateLimit(
-  ip: string,
-  kv: KVNamespace | undefined,
-): Promise<AbuseCheckResult & { record: DnsRateLimitRecord | null }> {
-  if (!kv) {
-    return { allowed: true, flag: 'clean', record: null };
-  }
-
-  const key = kvKey(ip);
-  let record: DnsRateLimitRecord | null = null;
-
-  try {
-    record = await kv.get<DnsRateLimitRecord>(key, 'json');
-  } catch {
-    return { allowed: true, flag: 'clean', record: null };
-  }
-
+function applyRateLimit(ip: string, suspicious: boolean): AbuseCheckResult | null {
   const t = Date.now();
+  const b = getBucket(ip);
 
   // Hard block still active?
-  if (record && record.blockUntil > t) {
-    const retryAfter = Math.ceil((record.blockUntil - t) / 1000);
+  if (b.blockUntil > t) {
+    const retryAfter = Math.ceil((b.blockUntil - t) / 1000);
     return {
       allowed: false,
       flag: 'rate_limited',
       response: buildRateLimitResponse(retryAfter),
-      record,
     };
   }
 
-  // Window expired? Reset.
-  if (!record || t - record.windowStart > WINDOW_SEC * 1000) {
-    record = { queryCount: 0, suspiciousCount: 0, blockUntil: 0, windowStart: t };
-  }
+  b.queryCount++;
+  if (suspicious) b.suspiciousCount++;
 
-  // Over query cap?
-  if (record.queryCount >= MAX_QUERIES_PER_MIN) {
-    record.blockUntil = t + BLOCK_DURATION_SEC * 1000;
-    try { await kv.put(key, JSON.stringify(record), { expirationTtl: BLOCK_DURATION_SEC + 60 }); } catch {}
+  // Over the per-minute cap, or too many suspicious queries → block
+  if (b.queryCount > MAX_QUERIES_PER_MIN || b.suspiciousCount >= MAX_SUSPICIOUS_PER_MIN) {
+    b.blockUntil = t + BLOCK_DURATION_MS;
     return {
       allowed: false,
       flag: 'rate_limited',
-      response: buildRateLimitResponse(BLOCK_DURATION_SEC),
-      record,
+      response: buildRateLimitResponse(Math.ceil(BLOCK_DURATION_MS / 1000)),
     };
   }
 
-  // Suspicious escalation: 3+ suspicious queries → block
-  if (record.suspiciousCount >= MAX_SUSPICIOUS_PER_MIN) {
-    record.blockUntil = t + BLOCK_DURATION_SEC * 1000;
-    try { await kv.put(key, JSON.stringify(record), { expirationTtl: BLOCK_DURATION_SEC + 60 }); } catch {}
-    return {
-      allowed: false,
-      flag: 'rate_limited',
-      response: buildRateLimitResponse(BLOCK_DURATION_SEC),
-      record,
-    };
-  }
-
-  return { allowed: true, flag: 'clean', record };
-}
-
-/**
- * Record a DNS query outcome into the rate limit counters.
- * Must be called with ctx.waitUntil() for non-blocking KV write.
- */
-export async function recordDnsQuery(
-  ip: string,
-  kv: KVNamespace | undefined,
-  suspicious: boolean,
-  currentRecord: DnsRateLimitRecord | null,
-): Promise<void> {
-  if (!kv) return;
-
-  const key = kvKey(ip);
-  const t = Date.now();
-
-  const record = currentRecord && (t - currentRecord.windowStart <= WINDOW_SEC * 1000)
-    ? { ...currentRecord }
-    : { queryCount: 0, suspiciousCount: 0, blockUntil: 0, windowStart: t };
-
-  record.queryCount++;
-  if (suspicious) {
-    record.suspiciousCount++;
-  }
-
-  // If this tips over a limit, set block
-  if (record.suspiciousCount >= MAX_SUSPICIOUS_PER_MIN) {
-    record.blockUntil = Date.now() + BLOCK_DURATION_SEC * 1000;
-  } else if (record.queryCount >= MAX_QUERIES_PER_MIN) {
-    record.blockUntil = Date.now() + BLOCK_DURATION_SEC * 1000;
-  }
-
-  const ttl = record.blockUntil > 0
-    ? Math.ceil((record.blockUntil - Date.now()) / 1000) + 60
-    : WINDOW_SEC + 60;
-
-  try {
-    await kv.put(key, JSON.stringify(record), { expirationTtl: Math.max(ttl, 60) });
-  } catch {
-    // Non-critical, never fail the DNS query
-  }
+  return null; // within limits
 }
 
 /* ── Main Abuse Check (combines all layers) ────────────── */
 
 /**
  * Full abuse check for a JSON-format DNS query.
+ * Checks AND records the query in one synchronous call.
  * Call BEFORE resolver. Returns allowed=false if the query should be refused.
  */
-export async function checkJsonAbuse(
+export function checkJsonAbuse(
   ip: string,
   domain: string,
   type: string,
-  kv: KVNamespace | undefined,
-): Promise<AbuseCheckResult & { _record: DnsRateLimitRecord | null }> {
-  // Layer 1: Rate limit
-  const rl = await checkDnsRateLimit(ip, kv);
-  if (!rl.allowed) {
-    return { allowed: false, flag: rl.flag, response: rl.response, _record: rl.record };
-  }
-
-  // Layer 2: Dangerous query type
+): AbuseCheckResult {
+  // Layer 1: dangerous query type (counts as suspicious)
   const dangerFlag = checkDangerousJsonQuery(type);
+  // Layer 2: DGA heuristic (allowed, but suspicious)
+  const dga = !dangerFlag && isDGA(domain);
+  const suspicious = !!dangerFlag || dga;
+
+  // Layer 3: rate limit (records this query)
+  const limited = applyRateLimit(ip, suspicious);
+  if (limited) return limited;
+
   if (dangerFlag) {
     return {
       allowed: false,
       flag: 'suspicious',
       response: buildRefusedJsonResponse('suspicious'),
-      _record: rl.record,
     };
   }
 
-  // Layer 3: DGA detection
-  if (isDGA(domain)) {
-    return {
-      allowed: true, // Allow but mark suspicious — let resolver handle
-      flag: 'suspicious',
-      _record: rl.record,
-    };
-  }
-
-  return { allowed: true, flag: 'clean', _record: rl.record };
+  return { allowed: true, flag: dga ? 'suspicious' : 'clean' };
 }
 
 /**
  * Full abuse check for a wireformat DNS query.
+ * Checks AND records the query in one synchronous call.
  * Call BEFORE resolver. Returns allowed=false if the query should be refused.
  */
-export async function checkWireAbuse(
+export function checkWireAbuse(
   ip: string,
   domain: string | null,
   buffer: ArrayBuffer,
-  kv: KVNamespace | undefined,
-): Promise<AbuseCheckResult & { _record: DnsRateLimitRecord | null }> {
-  // Layer 1: Rate limit
-  const rl = await checkDnsRateLimit(ip, kv);
-  if (!rl.allowed) {
-    return { allowed: false, flag: rl.flag, response: rl.response, _record: rl.record };
-  }
-
-  // Layer 2: Dangerous query type / class
+): AbuseCheckResult {
   const dangerFlag = checkDangerousWireQuery(buffer);
+  const dga = !dangerFlag && !!domain && isDGA(domain);
+  const suspicious = !!dangerFlag || dga;
+
+  const limited = applyRateLimit(ip, suspicious);
+  if (limited) return limited;
+
   if (dangerFlag) {
     return {
       allowed: false,
       flag: 'suspicious',
       response: buildRefusedWireResponse(buffer, 'suspicious'),
-      _record: rl.record,
     };
   }
 
-  // Layer 3: DGA detection (only if domain was parsed)
-  if (domain && isDGA(domain)) {
-    return {
-      allowed: true,
-      flag: 'suspicious',
-      _record: rl.record,
-    };
-  }
-
-  return { allowed: true, flag: 'clean', _record: rl.record };
+  return { allowed: true, flag: dga ? 'suspicious' : 'clean' };
 }

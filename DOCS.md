@@ -384,28 +384,28 @@ Cache API, DNS onbellekleme icin ideal secimdir.
 
 ## Istatistik Sistemi
 
-### Sampling Algoritmasi
+### Tamponlama (Buffering) Algoritmasi
 
 ```
-requestCounter++ (in-memory, per isolate)
+// Bellekte biriktir (kesin sayim, ornekleme yok)
+buffer.total++;
+if (blocked) buffer.blocked++;
+if (cached) buffer.cached++;
 
-if (requestCounter % 10 !== 0) return;  // %90 skip
-
-stats.total += 10;  // x10 carpan
-if (blocked) stats.blocked += 10;
-if (cached) stats.cached += 10;
+// KV'ye en fazla 5 dakikada bir yaz (read-modify-write)
+if (Date.now() - lastFlush >= 5 dk) flushStats(kv);
 ```
 
-**Neden sampling?**
+**Neden tamponlama?**
 - KV free tier: 1000 yazma/gun
-- Gunluk 100.000 DNS sorgusu varsa: 100.000 yazma gerekir
-- Sampling x10 ile: ~10.000 yazma gerekir → hala fazla
-- Ancak pratikte farkli isolate'ler counter'i paylasir, gercek yazma sayisi dusuk kalir
+- Sorgu basina yazma: tek bir telefon bile limiti saatler icinde tuketir
+- Tamponlama ile: isolate basina en fazla ~288 yazma/gun — sorgu hacminden bagimsiz
+- Sayimlar kesindir; flush'tan once olen isolate yalnizca kendi tamponunu kaybeder (hafif eksik sayim olabilir, fazla sayim asla)
 
 ### Veri Saklama
 
 - KV key: `stats:2026-02-13`
-- Expiration: 48 saat (otomatik temizlik, son 2 gun korunur)
+- Expiration: 8 gun (7 gunluk dashboard grafigi tam kalir)
 - `/admin/stats` son 7 gunu gosterir (eksik gunler icin sifir doner)
 
 ---

@@ -1,42 +1,226 @@
 /**
  * UnfilteredHub — DNS Blocker Engine
- * Checks domains against core blocklist + optional KV extended list.
- * Builds blocked DNS responses in both JSON and wireformat.
+ * Checks domains against the embedded core blocklist + an optional
+ * KV-backed extended blocklist/allowlist snapshot.
+ *
+ * ── Snapshot model (why not one KV key per domain) ──────────
+ * The previous design stored each blocked domain as its own KV key and
+ * issued one kv.get PER LABEL LEVEL per DNS query (a.b.c.example.com =
+ * 4 reads). At the free tier's 100k reads/day that dies quickly, and it
+ * adds per-query latency.
+ *
+ * Now the entire extended list lives in ONE KV value ("snapshot"):
+ *
+ *   KV key:   bl:snapshot:v1
+ *   Format:   plain text, one domain per line
+ *             "example.com"    → blocked (subdomains too)
+ *             "@good.com"      → allowlisted (overrides any block match)
+ *             "# comment"      → ignored
+ *
+ * Each isolate loads the snapshot once and caches the parsed Sets in
+ * memory for SNAPSHOT_TTL_MS (5 min) → at most ~1 KV read / 5 min / isolate,
+ * ZERO KV reads on the hot path. Refresh happens in the background
+ * (stale-while-revalidate) so DNS latency is never blocked by KV.
+ *
+ * Admin mutations write the snapshot back (1 read + 1 write per call)
+ * and invalidate the local cache immediately; other isolates converge
+ * within the TTL.
  */
 
 import { CORE_BLOCKLIST } from './blocklist';
+import { parseDomainFromWire } from './dnsWire';
+
+// Re-export for existing consumers (index.ts historically imported it here)
+export { parseDomainFromWire };
+
+/* ── Constants ─────────────────────────────────────────── */
+
+export const SNAPSHOT_KEY = 'bl:snapshot:v1';
+const SNAPSHOT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/* ── Snapshot state (module-level, per isolate) ────────── */
+
+export interface BlocklistSnapshot {
+  block: Set<string>;
+  allow: Set<string>;
+}
+
+const EMPTY_SNAPSHOT: BlocklistSnapshot = { block: new Set(), allow: new Set() };
+
+let cached: BlocklistSnapshot | null = null;
+let cachedAt = 0;
+let inflight: Promise<BlocklistSnapshot> | null = null;
+
+/** Test/ops helper — drop the in-memory snapshot so the next query reloads. */
+export function invalidateBlocklistCache(): void {
+  cached = null;
+  cachedAt = 0;
+  inflight = null;
+}
+
+/* ── Snapshot parsing / serialization ──────────────────── */
+
+export function parseSnapshotText(text: string): BlocklistSnapshot {
+  const block = new Set<string>();
+  const allow = new Set<string>();
+
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim().toLowerCase();
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('@')) {
+      const d = line.slice(1).trim();
+      if (d) allow.add(d);
+    } else {
+      block.add(line);
+    }
+  }
+
+  return { block, allow };
+}
+
+export function serializeSnapshot(snapshot: BlocklistSnapshot): string {
+  const lines: string[] = [];
+  for (const d of [...snapshot.allow].sort()) lines.push(`@${d}`);
+  for (const d of [...snapshot.block].sort()) lines.push(d);
+  return lines.join('\n');
+}
+
+/* ── Snapshot loading (stale-while-revalidate) ─────────── */
+
+async function fetchSnapshot(kv: KVNamespace): Promise<BlocklistSnapshot> {
+  try {
+    const text = await kv.get(SNAPSHOT_KEY);
+    const snap = text ? parseSnapshotText(text) : { block: new Set<string>(), allow: new Set<string>() };
+    cached = snap;
+    cachedAt = Date.now();
+    return snap;
+  } catch {
+    // KV unavailable → keep whatever we had (or empty); retry after TTL
+    cachedAt = Date.now();
+    return cached ?? EMPTY_SNAPSHOT;
+  } finally {
+    inflight = null;
+  }
+}
+
+/**
+ * Get the current snapshot without blocking the hot path:
+ *   - cache fresh   → return it (0 KV ops)
+ *   - cache stale   → return stale data, refresh in background
+ *   - first load    → await one KV read (per isolate lifetime)
+ */
+export function getSnapshot(
+  kv: KVNamespace | undefined,
+): BlocklistSnapshot | Promise<BlocklistSnapshot> {
+  if (!kv) return cached ?? EMPTY_SNAPSHOT;
+
+  const fresh = cached && Date.now() - cachedAt <= SNAPSHOT_TTL_MS;
+  if (cached && fresh) return cached;
+
+  if (cached) {
+    // Stale: serve old data now, revalidate in background
+    if (!inflight) inflight = fetchSnapshot(kv);
+    return cached;
+  }
+
+  // Cold start: must await the first load
+  if (!inflight) inflight = fetchSnapshot(kv);
+  return inflight;
+}
+
+/** Counts for admin/stats/transparency (may trigger one KV read on cold start). */
+export async function getBlocklistCounts(
+  kv: KVNamespace | undefined,
+): Promise<{ core: number; kvBlock: number; kvAllow: number }> {
+  const snap = await getSnapshot(kv);
+  return { core: CORE_BLOCKLIST.size, kvBlock: snap.block.size, kvAllow: snap.allow.size };
+}
+
+/* ── Domain matching ───────────────────────────────────── */
+
+function matchesSuffix(normalized: string, set: Set<string>): boolean {
+  const parts = normalized.split('.');
+  // Check each level: a.b.example.com → a.b.example.com, b.example.com, example.com
+  for (let i = 0; i < Math.max(1, parts.length - 1); i++) {
+    if (set.has(parts.slice(i).join('.'))) return true;
+  }
+  return false;
+}
 
 /**
  * Check if a domain (or any of its parent domains) is blocked.
- * Checks KV first (if available), then falls back to the embedded core list.
+ * Allowlist entries override block matches at any level.
+ * Pure in-memory after the snapshot is loaded — no per-query KV reads.
  */
 export async function isBlocked(
   domain: string,
   kv?: KVNamespace,
 ): Promise<boolean> {
   const normalized = domain.toLowerCase().replace(/\.$/, '');
-  const parts = normalized.split('.');
+  if (!normalized) return false;
 
-  // Check each level: ads.example.com → ads.example.com, example.com
-  for (let i = 0; i < parts.length - 1; i++) {
-    const candidate = parts.slice(i).join('.');
+  const snap = await getSnapshot(kv);
 
-    // KV check (extended list)
-    if (kv) {
-      try {
-        const val = await kv.get(candidate);
-        if (val !== null) return true;
-      } catch {
-        // KV unavailable, continue to core list
-      }
-    }
+  // Allowlist wins — never block explicitly allowed domains
+  if (matchesSuffix(normalized, snap.allow)) return false;
 
-    // Core embedded list
-    if (CORE_BLOCKLIST.has(candidate)) return true;
+  if (matchesSuffix(normalized, snap.block)) return true;
+  return matchesSuffix(normalized, CORE_BLOCKLIST);
+}
+
+/* ── Snapshot mutation (admin API) ─────────────────────── */
+
+export interface SnapshotMutation {
+  addBlock?: string[];
+  removeBlock?: string[];
+  addAllow?: string[];
+  removeAllow?: string[];
+}
+
+function normalizeDomains(domains: string[]): string[] {
+  return domains
+    .map((d) => d.toLowerCase().trim().replace(/\.$/, ''))
+    .filter((d) => d.length > 0 && d.includes('.'));
+}
+
+/**
+ * Apply a mutation to the KV snapshot (read-modify-write) and refresh
+ * the local in-memory cache. Costs exactly 1 KV read + 1 KV write.
+ * Returns the new counts.
+ */
+export async function mutateSnapshot(
+  kv: KVNamespace,
+  mutation: SnapshotMutation,
+): Promise<{ block: number; allow: number; changed: number }> {
+  const text = (await kv.get(SNAPSHOT_KEY)) ?? '';
+  const snap = parseSnapshotText(text);
+  let changed = 0;
+
+  for (const d of normalizeDomains(mutation.addBlock ?? [])) {
+    if (!snap.block.has(d)) { snap.block.add(d); changed++; }
+  }
+  for (const d of normalizeDomains(mutation.removeBlock ?? [])) {
+    if (snap.block.delete(d)) changed++;
+  }
+  for (const d of normalizeDomains(mutation.addAllow ?? [])) {
+    if (!snap.allow.has(d)) { snap.allow.add(d); changed++; }
+  }
+  for (const d of normalizeDomains(mutation.removeAllow ?? [])) {
+    if (snap.allow.delete(d)) changed++;
   }
 
-  return false;
+  if (changed > 0) {
+    await kv.put(SNAPSHOT_KEY, serializeSnapshot(snap));
+  }
+
+  // This isolate sees the change immediately; others converge within TTL
+  cached = snap;
+  cachedAt = Date.now();
+
+  return { block: snap.block.size, allow: snap.allow.size, changed };
 }
+
+/* ── Blocked DNS response builders ─────────────────────── */
 
 /**
  * Build a blocked DNS response in JSON format (application/dns-json).
@@ -96,41 +280,10 @@ export function buildBlockedWireResponse(queryBuffer: ArrayBuffer): Response {
   response[10] = 0;
   response[11] = 0;
 
-  return new Response(response.buffer, {
+  return new Response(response, {
     headers: {
       'Content-Type': 'application/dns-message',
       'Access-Control-Allow-Origin': '*',
     },
   });
-}
-
-/**
- * Parse domain name from a DNS wireformat query buffer.
- * DNS names are encoded as a sequence of labels: [length][chars][length][chars]...[0]
- */
-export function parseDomainFromWire(buffer: ArrayBuffer): string | null {
-  const data = new Uint8Array(buffer);
-
-  // DNS header is 12 bytes, question starts at byte 12
-  if (data.length < 13) return null;
-
-  const labels: string[] = [];
-  let offset = 12;
-
-  while (offset < data.length) {
-    const len = data[offset];
-    if (len === 0) break; // Root label
-
-    // Pointer (compression) — shouldn't appear in questions, but handle it
-    if ((len & 0xc0) === 0xc0) break;
-
-    // Sanity check
-    if (len > 63 || offset + 1 + len > data.length) return null;
-
-    const label = new TextDecoder().decode(data.slice(offset + 1, offset + 1 + len));
-    labels.push(label);
-    offset += 1 + len;
-  }
-
-  return labels.length > 0 ? labels.join('.') : null;
 }
